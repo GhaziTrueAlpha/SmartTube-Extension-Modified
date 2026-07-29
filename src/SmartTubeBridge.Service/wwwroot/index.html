@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SmartTube Bridge</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --ok: #22c55e;
+      --bad: #ef4444;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1e3a5f 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { margin: 0 0 6px; font-size: 1.6rem; font-weight: 650; }
+    .sub { color: var(--muted); margin-bottom: 22px; font-size: 0.95rem; }
+    .grid { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+    @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, white 2%);
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 0.85rem; letter-spacing: 0.06em; color: var(--muted); text-transform: uppercase; }
+    .status-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 999px; background: #0b1220; border: 1px solid #334155;
+      font-size: 0.9rem;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 8px #22c55e88; }
+    .dot.warn { background: var(--warn); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+    button, .btn {
+      appearance: none; border: 1px solid #475569; background: #334155; color: var(--text);
+      border-radius: 8px; padding: 8px 12px; cursor: pointer; font: inherit;
+    }
+    button:hover { background: #3f5169; }
+    button.primary { background: #0284c7; border-color: #0ea5e9; }
+    button.primary:hover { background: #0369a1; }
+    input[type="text"] {
+      flex: 1; min-width: 160px; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid #475569; background: #0b1220; color: var(--text); font: inherit;
+    }
+    .volume {
+      display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center;
+      margin-top: 8px;
+    }
+    input[type="range"] { width: 100%; accent-color: var(--accent); }
+    .msg { min-height: 1.2em; color: var(--muted); font-size: 0.9rem; margin-top: 10px; }
+    .mono { font-family: Consolas, monospace; font-size: 0.85rem; color: var(--muted); word-break: break-all; }
+    .full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SmartTube Bridge</h1>
+    <p class="sub">Local control panel — cast YouTube, remote media, and manage ADB.</p>
+
+    <div class="grid">
+      <div class="card full">
+        <h2>Connection</h2>
+        <div class="status-row">
+          <span class="pill"><span id="svc-dot" class="dot"></span> <span id="svc-text">Checking…</span></span>
+          <span class="pill"><span id="adb-dot" class="dot"></span> ADB: <span id="adb-text">—</span></span>
+          <span class="pill">TV: <span id="dev-text">—</span></span>
+        </div>
+        <p class="mono" id="adb-path" style="margin-top:10px"></p>
+        <div class="row" style="margin-top:12px">
+          <input id="tv-ip" type="text" placeholder="TV IP e.g. 192.168.1.50" />
+          <button class="primary" id="btn-connect">Connect & Save</button>
+          <button id="btn-scan">Scan Devices</button>
+          <button id="btn-refresh">Refresh</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Playback</h2>
+        <div class="row">
+          <button data-media="playpause">Play/Pause</button>
+          <button data-media="previous">Prev</button>
+          <button data-media="next">Next</button>
+          <button data-media="rewind">Rewind</button>
+          <button data-media="forward">Forward</button>
+          <button data-media="stop">Stop</button>
+        </div>
+        <div class="row">
+          <button data-media="home">Home</button>
+          <button data-media="back">Back</button>
+          <button data-media="dpad/up">▲</button>
+          <button data-media="dpad/down">▼</button>
+          <button data-media="dpad/left">◀</button>
+          <button data-media="dpad/right">▶</button>
+          <button data-media="dpad/center">Select</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Volume</h2>
+        <div class="row">
+          <button data-media="volume/down">Vol −</button>
+          <button data-media="volume/mute">Mute</button>
+          <button data-media="volume/up">Vol +</button>
+        </div>
+        <div class="volume">
+          <span>0</span>
+          <input id="vol-slider" type="range" min="0" max="15" value="8" />
+          <span id="vol-label">8</span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="btn-set-vol">Set Volume</button>
+        </div>
+      </div>
+
+      <div class="card full">
+        <h2>Cast URL</h2>
+        <div class="row">
+          <input id="cast-url" type="text" placeholder="https://www.youtube.com/watch?v=..." />
+          <button class="primary" id="btn-cast">Play on SmartTube</button>
+        </div>
+        <p class="msg" id="msg"></p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API = location.origin + '/api';
+    const msg = (t) => { document.getElementById('msg').textContent = t || ''; };
+    const setDot = (id, ok) => {
+      const el = document.getElementById(id);
+      el.className = 'dot' + (ok === true ? ' ok' : ok === 'warn' ? ' warn' : '');
+    };
+
+    async function api(path, opts) {
+      const resp = await fetch(API + path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.success === false) throw new Error(data.message || ('HTTP ' + resp.status));
+      return data;
+    }
+
+    async function refresh() {
+      try {
+        const s = await api('/status');
+        const d = s.data || {};
+        setDot('svc-dot', true);
+        document.getElementById('svc-text').textContent = 'Service online';
+        const adbOk = String(d.adbState).toLowerCase() === 'running';
+        setDot('adb-dot', adbOk ? true : 'warn');
+        document.getElementById('adb-text').textContent = d.adbState || 'Unknown';
+        document.getElementById('dev-text').textContent = d.isConnected
+          ? (d.currentDevice?.friendlyName || d.currentDevice?.serial || 'Connected')
+          : 'Not connected';
+        document.getElementById('adb-path').textContent = 'ADB: ' + (d.adbPath || 'adb');
+        msg('');
+      } catch (e) {
+        setDot('svc-dot', false);
+        setDot('adb-dot', false);
+        document.getElementById('svc-text').textContent = 'Service offline';
+        document.getElementById('adb-text').textContent = '—';
+        document.getElementById('dev-text').textContent = '—';
+        msg(e.message);
+      }
+    }
+
+    document.getElementById('btn-refresh').onclick = refresh;
+    document.getElementById('btn-scan').onclick = async () => {
+      try {
+        const r = await api('/device/scan', { method: 'POST', body: '{}' });
+        const n = (r.data || []).length;
+        msg(`Found ${n} device(s)`);
+        await refresh();
+      } catch (e) { msg(e.message); }
+    };
+    document.getElementById('btn-connect').onclick = async () => {
+      const ip = document.getElementById('tv-ip').value.trim();
+      if (!ip) return msg('Enter TV IP');
+      try {
+        await api('/device/connect', { method: 'POST', body: JSON.stringify({ ip, port: 5555 }) });
+        msg('Connected and saved: ' + ip);
+        await refresh();
+      } catch (e) { msg(e.message); }
+    };
+    document.getElementById('btn-cast').onclick = async () => {
+      const url = document.getElementById('cast-url').value.trim();
+      if (!url) return msg('Paste a YouTube URL');
+      try {
+        await api('/cast', { method: 'POST', body: JSON.stringify({ url }) });
+        msg('Sent to SmartTube');
+      } catch (e) { msg(e.message); }
+    };
+    document.querySelectorAll('[data-media]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          await api('/media/' + btn.dataset.media, { method: 'POST', body: '{}' });
+          msg(btn.dataset.media);
+        } catch (e) { msg(e.message); }
+      });
+    });
+
+    const slider = document.getElementById('vol-slider');
+    const volLabel = document.getElementById('vol-label');
+    let volTimer = null;
+    async function applyVolume() {
+      try {
+        await api('/media/volume', {
+          method: 'POST',
+          body: JSON.stringify({ level: Number(slider.value) })
+        });
+        msg('Volume set to ' + slider.value);
+      } catch (e) { msg(e.message); }
+    }
+    slider.oninput = () => {
+      volLabel.textContent = slider.value;
+      clearTimeout(volTimer);
+      volTimer = setTimeout(applyVolume, 200);
+    };
+    document.getElementById('btn-set-vol').onclick = applyVolume;
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

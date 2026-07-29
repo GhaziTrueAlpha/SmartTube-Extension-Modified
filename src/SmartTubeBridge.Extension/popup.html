@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>SmartTube Bridge</h1>
+      <div class="header-actions">
+        <span id="status-dot" class="dot offline" title="Service status"></span>
+        <button id="expand-btn" class="btn icon-sm" title="Expand / collapse">↕</button>
+      </div>
+    </div>
+
+    <div id="device-info" class="device-row disconnected">
+      <span>TV: </span><span id="device-name">Not connected</span>
+    </div>
+
+    <label class="toggle-row" title="When on, clicking the extension on a YouTube video tab plays it immediately. Hold Shift while opening to bypass.">
+      <input type="checkbox" id="play-on-click">
+      <span>Play on click</span>
+    </label>
+    <p id="play-on-click-hint" class="hint">Hold <kbd>Shift</kbd> while opening to open popup without playing.</p>
+
+    <label class="field" style="margin-bottom:8px">Playback mode
+      <select id="playback-mode">
+        <option value="tvOnly">TV only (laptop paused)</option>
+        <option value="synced">Synced (laptop leads + Up Next)</option>
+        <option value="independent">Independent</option>
+      </select>
+    </label>
+
+    <button id="cast-btn" class="btn primary">Play Current Video</button>
+    <button id="stop-cast-btn" class="btn danger hidden">Stop Casting</button>
+    <button id="sync-btn" class="btn hidden" title="Re-seek TV and wait for delay so both start together">🔄 Sync Now</button>
+
+    <div id="delay-row" class="hidden">
+      <div class="volume-row">
+        <button id="delay-off-btn" class="btn small" type="button">Delay Off</button>
+        <label class="toggle-row" style="margin:0;flex:1">
+          <input type="checkbox" id="delay-comp" checked>
+          <span>Use delays</span>
+        </label>
+      </div>
+      <div id="comp-sliders" class="hidden">
+        <div class="volume-row">
+          <span title="Hold laptop when TV is behind">Delay laptop</span>
+          <input id="delay-laptop" type="range" min="0" max="5000" step="50" value="1350">
+          <span id="delay-laptop-label">1.4s</span>
+        </div>
+        <div class="volume-row">
+          <span title="Hold TV when laptop is behind">Delay TV</span>
+          <input id="delay-tv" type="range" min="0" max="5000" step="50" value="0">
+          <span id="delay-tv-label">0.0s</span>
+        </div>
+      </div>
+      <div class="volume-row">
+        <label class="toggle-row" style="margin:0;flex:1">
+          <input type="checkbox" id="manual-delay">
+          <span>Manual settle</span>
+        </label>
+      </div>
+    </div>
+    <div id="delay-slider-row" class="volume-row hidden">
+      <span>Settle</span>
+      <input id="delay-slider" type="range" min="0" max="10000" step="100" value="4200">
+      <span id="delay-label">4.2s</span>
+    </div>
+
+    <div id="seek-row" class="volume-row hidden">
+      <span>Seek</span>
+      <div class="seek-track">
+        <input id="seek-slider" type="range" min="0" max="100" value="0">
+        <div id="seek-tip" class="seek-tip hidden">0:00</div>
+      </div>
+      <span id="seek-label">0:00</span>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="media-row">
+      <button class="btn icon" data-action="playpause" title="Play/Pause">⏯</button>
+      <button class="btn icon" data-action="previous" title="Previous">⏮</button>
+      <button class="btn icon" data-action="next" title="Next">⏭</button>
+      <button class="btn icon" data-action="rewind" title="Rewind">⏪</button>
+      <button class="btn icon" data-action="forward" title="Forward">⏩</button>
+    </div>
+
+    <div class="media-row">
+      <button class="btn icon" data-action="volume/down" title="Volume Down">🔉</button>
+      <button class="btn icon" data-action="volume/mute" title="Mute">🔇</button>
+      <button class="btn icon" data-action="volume/up" title="Volume Up">🔊</button>
+      <button class="btn icon" data-action="home" title="Home">🏠</button>
+      <button class="btn icon" data-action="back" title="Back">↩</button>
+    </div>
+
+    <div class="search-row">
+      <input type="text" id="search-input" placeholder="Search YouTube...">
+      <button id="search-go" class="btn small">Go</button>
+    </div>
+
+    <!-- Expanded dashboard panel -->
+    <div id="expand-panel" class="expand-panel hidden">
+      <div class="divider"></div>
+
+      <section class="panel-section">
+        <h2>Navigation</h2>
+        <div class="dpad">
+          <button class="btn icon dpad-up" data-action="dpad/up" title="Up">▲</button>
+          <button class="btn icon dpad-left" data-action="dpad/left" title="Left">◀</button>
+          <button class="btn icon dpad-ok" data-action="dpad/center" title="OK / Select">OK</button>
+          <button class="btn icon dpad-right" data-action="dpad/right" title="Right">▶</button>
+          <button class="btn icon dpad-down" data-action="dpad/down" title="Down">▼</button>
+        </div>
+        <div class="media-row" style="margin-top:8px;margin-bottom:0">
+          <button class="btn icon" data-action="home" title="Home">🏠</button>
+          <button class="btn icon" data-action="back" title="Back">↩</button>
+          <button class="btn icon" data-action="dpad/center" title="OK / Select">OK</button>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <h2>Devices</h2>
+        <div class="row gap">
+          <button id="scan-btn" class="btn small">Scan</button>
+          <button id="disconnect-btn" class="btn small">Disconnect</button>
+        </div>
+        <ul id="device-list" class="device-list"></ul>
+        <div class="row gap">
+          <input type="text" id="manual-ip" placeholder="TV IP (e.g. 192.168.1.136)">
+          <button id="connect-btn" class="btn small primary-sm" disabled>Connect</button>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <h2>Settings</h2>
+        <label class="field">ADB Path
+          <input type="text" id="adb-path" placeholder="adb or full path">
+        </label>
+        <label class="field">Package
+          <input type="text" id="package-name" placeholder="org.smarttube.stable">
+        </label>
+        <label class="field">Wake Delay
+          <select id="wake-delay">
+            <option value="100">100ms</option>
+            <option value="250">250ms</option>
+            <option value="500" selected>500ms</option>
+            <option value="1000">1000ms</option>
+            <option value="2000">2000ms</option>
+          </select>
+        </label>
+        <button id="save-settings" class="btn small primary-sm" style="width:100%;margin-top:6px">Save Settings</button>
+      </section>
+
+      <section class="panel-section">
+        <h2>Logs <button id="refresh-logs" class="btn tiny">Refresh</button></h2>
+        <div id="log-list" class="log-list"></div>
+      </section>
+
+      <section class="panel-section">
+        <h2>Setup</h2>
+        <ol class="setup-steps">
+          <li>Confirm ADB path above</li>
+          <li>Scan / connect your TV IP</li>
+          <li>Open a YouTube video and press Play</li>
+        </ol>
+        <button id="test-connection" class="btn small" style="width:100%">Test Connection</button>
+      </section>
+    </div>
+
+    <div id="error" class="error hidden"></div>
+    <div id="status-msg" class="status-msg"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

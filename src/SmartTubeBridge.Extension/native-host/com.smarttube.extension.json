@@ -1,0 +1,7 @@
+{
+  "name": "com.smarttube.extension",
+  "description": "Native host for SmartTube Chrome Extension",
+  "path": "smarttube_host.bat",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://YOUR_EXTENSION_ID_HERE"]
+}

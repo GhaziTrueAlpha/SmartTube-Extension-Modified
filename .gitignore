@@ -1,0 +1,33 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.log
+*.vs/
+.DS_Store
+
+# Build outputs
+dist/
+packages/
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Node
+node_modules/
+
+# NuGet
+packages/
+*.nupkg
+
+# Command Code
+.commandcode/
