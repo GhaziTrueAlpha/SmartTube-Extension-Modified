@@ -245,9 +245,18 @@ http://localhost:8765  # open in browser
 chrome://extensions → Developer Mode → Load Unpacked → src/SmartTubeBridge.Extension
 ```
 
+### One-Time Setup (Recommended)
+```powershell
+# Run as Administrator — does everything in one shot
+.\scripts\setup.ps1
+```
+Builds, tests, installs service with auto-start + network deps, creates desktop shortcuts, loads extension.
+
+Options: `-SkipBuild`, `-SkipService`, `-SkipExtension`, `-SkipAutostart`
+
 ---
 
-## 4. Known Issues & Fixes Applied
+## 4. Known Issues & Fixes Applied (Chronological)
 
 | Issue | Fix |
 |-------|-----|
@@ -257,6 +266,10 @@ chrome://extensions → Developer Mode → Load Unpacked → src/SmartTubeBridge
 | Dashboard crash on ADB path with spaces | Put quotes around commands or fix path parsing |
 | Mutex collision between session 0 (service) and session 1 (console) | Changed mutex from `Local\` to `Global\` prefix for cross-session singleton |
 | Old `dotnet exec` instances holding port 8765 | Must be killed via Task Manager or reboot |
+| **Device scan button showing empty list in Dashboard** | Poll loop overwrote scan results; fixed by using `GET /api/device` (now refreshes live). `AdbService.ScanDevicesAsync` now auto-starts ADB on demand instead of throwing |
+| **Auto-connect never running after ADB start failure** | `SmartTubeWorker` now catches ADB startup separately and always runs auto-connect for saved devices |
+| **ADB not found under SYSTEM account (Windows Service)** | `AdbPathHelper` probes all `C:\Users\*\AppData\Local` for Android SDK + WinGet `adb.exe` |
+| **Service not starting on reboot** | Changed from `delayed-auto` to `auto` with `depend=Tcpip/Dhcp/Dnscache` — waits for network stack before starting |
 
 ## 5. Current Running State
 

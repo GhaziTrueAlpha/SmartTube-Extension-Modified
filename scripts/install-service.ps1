@@ -81,8 +81,8 @@ New-Service -Name $serviceName `
     -StartupType Automatic `
     -ErrorAction Stop
 
-# Delayed auto-start + recovery
-sc.exe config $serviceName start= delayed-auto | Out-Null
+# Auto-start (not delayed) + network dependencies + recovery
+sc.exe config $serviceName start= auto depend= Tcpip/Dhcp/Dnscache | Out-Null
 sc.exe failure $serviceName reset=86400 actions=restart/5000/restart/10000/restart/30000 | Out-Null
 sc.exe failureflag $serviceName 1 | Out-Null
 
