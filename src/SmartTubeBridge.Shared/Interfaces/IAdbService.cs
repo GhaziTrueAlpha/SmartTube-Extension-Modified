@@ -24,8 +24,29 @@ public interface IAdbService
 
 public sealed class PlaybackPosition
 {
+    /// <summary>
+    /// Position extrapolated to "now": RawPositionMs + StalenessMs * Speed.
+    /// This is what callers should use for sync; the raw snapshot can be many
+    /// seconds old (82s observed on Acer R4_GTV).
+    /// </summary>
     public long PositionMs { get; set; }
+
+    /// <summary>Snapshot value straight from the PlaybackState dump.</summary>
+    public long RawPositionMs { get; set; }
+
+    /// <summary>How old the snapshot was when read, in ms (deviceNow - updated).</summary>
+    public long StalenessMs { get; set; }
+
+    /// <summary>Playback speed from the dump; 0.0 while paused.</summary>
+    public double Speed { get; set; }
+
     public long DurationMs { get; set; }
     public bool IsPlaying { get; set; }
     public string? Package { get; set; }
+
+    /// <summary>Track title from the media session metadata, when present.</summary>
+    public string? Title { get; set; }
+
+    /// <summary>Artist/channel from the media session metadata, when present.</summary>
+    public string? Artist { get; set; }
 }

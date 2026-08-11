@@ -36,6 +36,8 @@
   let nextVideoTimer = null;
   /** @type {ReturnType<typeof setTimeout>|null} */
   let seekAlignTimer = null;
+  /** @type {ReturnType<typeof setInterval>|null} */
+  let navTickTimer = null;
 
   /** TV seek settle delay (ms). Used when manualDelay is on; otherwise auto-calibrated. */
   let seekDelayMs = 4200;
@@ -70,6 +72,27 @@
 
   function isWatchPage() {
     return !!extractVideoId();
+  }
+
+  /** Playlist id of the tab, or null when watching a standalone video. */
+  function currentPlaylistId() {
+    try {
+      const list = new URL(location.href).searchParams.get('list');
+      return list && list.trim() ? list.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Cast URL carrying the playlist when there is one, so SmartTube queues the same
+   * songs the laptop has rather than its own Related list.
+   */
+  function buildCastUrl(videoId) {
+    const list = currentPlaylistId();
+    return list
+      ? `https://www.youtube.com/watch?v=${videoId}&list=${encodeURIComponent(list)}`
+      : `https://www.youtube.com/watch?v=${videoId}`;
   }
 
   function getLaptopVideo() {
@@ -152,7 +175,12 @@
     setTimeout(() => { syncingFromTv = false; }, Math.min(ms, 1200));
   }
 
-  function seekLaptopSeconds(sec, { force = false } = {}) {
+  /**
+   * blockMs must stay just long enough to swallow the `seeked` events this call
+   * itself generates. Drift corrections run every 2s, so a long block here would
+   * make genuine user seeks undetectable — that is exactly what broke seeking.
+   */
+  function seekLaptopSeconds(sec, { force = false, blockMs = 3500 } = {}) {
     // Never rewind the laptop from TV near the start — that causes the end→0 loop.
     if (!force) {
       const local = laptopPositionSec();
@@ -161,7 +189,7 @@
       if (dur > 0 && local > dur - 5) return;
     }
 
-    blockUserSeekEvents(3500);
+    blockUserSeekEvents(blockMs);
     try {
       const p = getYtPlayer();
       if (p?.seekTo) p.seekTo(sec, true);
@@ -217,6 +245,10 @@
 
   async function handleLaptopEnded() {
     if (!(castingSession && playbackMode === 'synced') || endHandled) return;
+    // The TV already claimed this transition and we're following it — don't also
+    // drive a next-track from this side, or the two chase each other.
+    if (masterLockHeldBy('laptop')) return;
+    claimMaster('laptop');
     endHandled = true;
     tvHeldAtEnd = true;
     setStatus('Playing next (YouTube Up Next)…', 'busy');
@@ -300,8 +332,58 @@
     return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
   }
 
+  /**
+   * True once this content script has been orphaned — i.e. the extension was
+   * reloaded/updated while this tab kept running the old script. Every
+   * chrome.runtime call then throws "Extension context invalidated", and the
+   * 2s poll turns that into an endless stream of uncaught promise rejections.
+   */
+  let contextDead = false;
+
+  function extensionAlive() {
+    try {
+      return !contextDead && !!chrome.runtime?.id;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Stop every timer and tell the user, exactly once. */
+  function handleDeadContext() {
+    if (contextDead) return;
+    contextDead = true;
+
+    stopSyncPoll();
+    stopKeepPaused();
+    clearInterval(volumeHoldTimer);
+    clearTimeout(seekDebounce);
+    clearTimeout(nextVideoTimer);
+    clearTimeout(seekAlignTimer);
+    clearInterval(tvBarTimer);
+    if (navTickTimer) clearInterval(navTickTimer);
+
+    // Leave the tab in a sane state rather than half-controlled.
+    try { resetLaptopRate(); restoreLaptopAudio(); } catch { /* */ }
+    setStatus('Extension reloaded — refresh this page (F5)', 'error');
+  }
+
   async function api(action, payload = {}) {
-    return chrome.runtime.sendMessage({ action, ...payload });
+    if (!extensionAlive()) {
+      handleDeadContext();
+      return null;
+    }
+    try {
+      return await chrome.runtime.sendMessage({ action, ...payload });
+    } catch (e) {
+      const msg = String(e?.message || e);
+      if (msg.includes('Extension context invalidated') ||
+          msg.includes('Receiving end does not exist') ||
+          msg.includes('message port closed')) {
+        handleDeadContext();
+        return null;
+      }
+      throw e;
+    }
   }
 
   async function pushSeekToTv(sec) {
@@ -364,25 +446,328 @@
     return elapsed;
   }
 
-  /**
-   * Do NOT change playbackRate — that made songs sound slow on the laptop
-   * while the TV stayed at normal speed. Keep rate at 1; use Sync/seek lag
-   * compensation only for alignment.
-   */
-  function applyTimeBridge(_local, _tvSec, _tvPlaying) {
-    resetLaptopRate();
-  }
+  // Note: drift is corrected by seeking the laptop (see correctDrift), never by
+  // changing playbackRate — that made songs sound slow on the laptop while the TV
+  // stayed at normal speed.
 
   /** Read TV clock; return seconds or null. */
   async function readTvSeconds() {
+    const s = await sampleTv();
+    return s ? s.tvSec : null;
+  }
+
+  // ── TV clock (dead reckoning) ──────────────────────────────────────────────
+  // The service now extrapolates the dumpsys snapshot to "now", but samples still
+  // cost an ADB round trip. Anchoring each sample and predicting locally between
+  // them gives better accuracy at half the polling rate.
+  let tvAnchorSec = null;
+  let tvAnchorAt = 0;
+  let tvAnchorPlaying = false;
+
+  /** One position sample; also refreshes the anchor and feeds the track arbiter. */
+  async function sampleTv() {
     try {
       const resp = await api('position', {});
       const d = resp?.data;
       if (!d?.available || !Number.isFinite(d.positionMs)) return null;
-      return Math.max(0, d.positionMs / 1000);
+
+      const tvSec = Math.max(0, d.positionMs / 1000);
+      tvAnchorSec = tvSec;
+      tvAnchorAt = performance.now();
+      tvAnchorPlaying = d.isPlaying === true;
+
+      detectTvTransition(tvSec, tvAnchorPlaying, d.title, d.artist);
+
+      return {
+        tvSec,
+        isPlaying: tvAnchorPlaying,
+        title: d.title || null,
+        artist: d.artist || null,
+        stalenessMs: Number(d.stalenessMs) || 0,
+      };
     } catch {
       return null;
     }
+  }
+
+  /** Predicted TV position right now, or null if we have no anchor yet. */
+  function predictedTvSec() {
+    if (tvAnchorSec == null) return null;
+    if (!tvAnchorPlaying) return tvAnchorSec;
+    return tvAnchorSec + (performance.now() - tvAnchorAt) / 1000;
+  }
+
+  function resetTvClock() {
+    tvAnchorSec = null;
+    tvAnchorAt = 0;
+    tvAnchorPlaying = false;
+    // Forget the previous position too, or the jump to a new track's 0:00 would
+    // register as a rewind and fire a second, spurious transition.
+    lastTvSampleSec = null;
+  }
+
+  // ── Track arbiter (dynamic master) ─────────────────────────────────────────
+  // Whichever side advances first owns the transition. An 8s lock stops the two
+  // sides from chasing each other into a ping-pong loop.
+  const MASTER_LOCK_MS = 8000;
+  let masterSide = null;      // 'laptop' | 'tv'
+  let masterUntil = 0;
+  let lastTvTitle = null;
+  /** While set, page navigations are TV-driven and must not trigger a re-cast. */
+  let followingTvUntil = 0;
+  /**
+   * Set when a mid-track change on the TV shows the user picked a song by hand.
+   * While true the laptop playlist stops asserting itself. Any deliberate action on
+   * the laptop side — cast, recast, sync, or manually opening another video — hands
+   * authority back to the playlist.
+   */
+  let tvManualOverride = false;
+
+  function restoreLaptopAuthority(reason) {
+    if (!tvManualOverride) return;
+    tvManualOverride = false;
+    if (reason) setStatus(reason, 'ok');
+  }
+
+  function masterLockHeldBy(side) {
+    return Date.now() < masterUntil && masterSide !== side;
+  }
+
+  let laptopPriorityTimer = null;
+
+  function claimMaster(side) {
+    masterSide = side;
+    masterUntil = Date.now() + MASTER_LOCK_MS;
+    if (side === 'laptop') armLaptopPriorityFallback();
+  }
+
+  /**
+   * The laptop gets first refusal on every transition. But if it never actually
+   * starts playing — autoplay blocked, queue exhausted, tab throttled — holding the
+   * lock would leave the two sides stuck on different songs. So if the laptop has
+   * not started within 6s, hand the transition to the TV and follow whatever it
+   * moved on to.
+   */
+  function armLaptopPriorityFallback() {
+    clearTimeout(laptopPriorityTimer);
+    laptopPriorityTimer = setTimeout(async () => {
+      if (!castingSession || contextDead) return;
+      if (masterSide !== 'laptop') return;
+
+      const v = getLaptopVideo();
+      const laptopPlaying = !!v && !v.paused && !v.ended && v.currentTime > 0;
+      // In TV-only the laptop is paused by design — never treat that as a stall.
+      if (laptopPlaying || playbackMode === 'tvOnly') return;
+
+      const s = await sampleTv();
+      if (!s?.title) return;
+
+      masterSide = null;
+      masterUntil = 0;
+      setStatus('Laptop did not start — following TV', 'busy');
+      claimMaster('tv');
+      lastTvTitle = s.title;
+      followTvTrack(s.title, s.artist);
+    }, 6000);
+  }
+
+  function normalizeTitle(s) {
+    return String(s || '')
+      .toLowerCase()
+      .replace(/\((official|lyrical|full)?\s*(video|audio|song|music video|visualizer)\)/g, '')
+      .replace(/\[[^\]]*\]/g, '')
+      .replace(/[|].*$/, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  /** Last position we saw, used to spot the rewind that means "new track". */
+  let lastTvSampleSec = null;
+  let lastTransitionAt = 0;
+
+  /**
+   * Decide whether the TV moved to a different track.
+   *
+   * Metadata cannot be relied on: this SmartTube build reports
+   * `description=null, null, null` indefinitely, so a title-only trigger never
+   * fires. A large backwards jump in position while playing is the signal that
+   * actually works — a track can only rewind that far by restarting.
+   */
+  function detectTvTransition(tvSec, isPlaying, title, artist) {
+    const prev = lastTvSampleSec;
+    lastTvSampleSec = tvSec;
+
+    const titleChanged = !!title && lastTvTitle !== null && title !== lastTvTitle;
+    if (title) lastTvTitle = title;
+
+    // A rewind we did not ask for = the TV started something new. Measured on the
+    // real device, a track change lands as 10021ms -> 0ms, so a fixed 15s threshold
+    // misses changes that happen early in a track. Treat "snapped back to the top"
+    // as a transition in its own right.
+    const rewound = prev != null && isPlaying && (
+      (tvSec < 5 && prev > 7) ||   // restarted from the beginning
+      tvSec < prev - 15            // jumped a long way back
+    );
+
+    if (!titleChanged && !rewound) return;
+    // Our own seeks rewind the TV too — those are not track changes.
+    if (userIsDrivingSeek() || seekAlignInProgress) return;
+    // One transition at a time; SmartTube emits several samples per change.
+    if (Date.now() - lastTransitionAt < 6000) return;
+    lastTransitionAt = Date.now();
+
+    onTvTrackChanged(title, artist, prev);
+  }
+
+  /**
+   * Was the TV close enough to the end that this transition is a natural
+   * auto-advance rather than someone picking a different song on the remote?
+   *
+   * SponsorBlock cuts outros, so the TV can legitimately finish well before the
+   * nominal duration — hence a proportional threshold rather than "within N seconds
+   * of the end". A mid-track jump is what identifies a deliberate manual change.
+   */
+  function looksLikeNaturalEnd(prevSec) {
+    if (prevSec == null) return true;          // no history — assume auto-advance
+    const dur = laptopDurationSec();
+    if (!(dur > 0)) return true;               // can't judge — don't fight the playlist
+    return prevSec >= dur * 0.6;
+  }
+
+  /**
+   * The TV advanced. Who supplies the next song depends on whether the laptop has a
+   * playlist:
+   *  - playlist present -> the laptop's queue is the source of truth, so advance it
+   *    and cast that. This is what makes SponsorBlock's early endings work: the TV
+   *    finishing early is simply the cue to move the laptop on.
+   *  - no playlist -> nothing to advance, so follow whatever the TV picked (needs a
+   *    title; without one there is no way to know what is playing).
+   */
+  function onTvTrackChanged(title, artist, prevSec) {
+    if (!castingSession || playbackMode === 'independent') return;
+
+    const hasPlaylist = !!currentPlaylistId();
+
+    if (hasPlaylist && !tvManualOverride) {
+      if (looksLikeNaturalEnd(prevSec)) {
+        // Natural end (including a SponsorBlock-shortened one): the laptop playlist
+        // decides what comes next, and casting it brings the TV along.
+        claimMaster('laptop');
+        setStatus('TV finished — next from laptop playlist…', 'busy');
+        endHandled = true;
+        tvHeldAtEnd = false;
+        if (!goToYouTubeNext()) {
+          setStatus('Could not advance laptop playlist', 'error');
+        }
+        return;
+      }
+
+      // Mid-track jump: someone chose a different song on the remote. Hand control
+      // over rather than yanking the TV back to the playlist and fighting the user.
+      tvManualOverride = true;
+      setStatus('TV changed manually — playlist paused', 'busy');
+    }
+
+    if (title) {
+      claimMaster('tv');
+      followTvTrack(title, artist);
+    } else {
+      setStatus('TV changed track (title unavailable)', 'busy');
+    }
+  }
+
+  /**
+   * TV moved to a new track on its own. Only title/artist are available (no video
+   * id), so match against the on-page queue first — both sides draw from the same
+   * Mix, which makes that match exact in practice — and fall back to search.
+   */
+  function followTvTrack(title, artist) {
+    setStatus(`TV changed track — following…`, 'busy');
+    const want = normalizeTitle(title);
+    if (!want) return;
+
+    // Marks the navigation we are about to trigger as TV-driven, so onVideoChanged
+    // does not bounce the same video straight back at the TV.
+    followingTvUntil = Date.now() + 12000;
+
+    const candidates = document.querySelectorAll(
+      'ytd-playlist-panel-video-renderer a#wc-endpoint, ' +
+      'ytd-compact-video-renderer a#thumbnail, ' +
+      'ytd-playlist-panel-video-renderer #video-title'
+    );
+
+    for (const el of candidates) {
+      const label = el.getAttribute('title') || el.textContent || '';
+      const got = normalizeTitle(label);
+      if (!got) continue;
+      if (got === want || got.includes(want) || want.includes(got)) {
+        const clickable = el.closest('a') || el;
+        endHandled = true;          // suppress our own end-of-track handler
+        tvHeldAtEnd = false;
+        clickable.click();
+        setStatus(`Following TV: ${title}`, 'ok');
+        return;
+      }
+    }
+
+    // Not in the visible queue — search, then open the top hit. The results page is
+    // a fresh document, so the intent has to survive navigation; sessionStorage is
+    // per-tab and cleared when the tab closes, which is exactly the lifetime we want.
+    const query = artist ? `${title} ${artist}` : title;
+    try {
+      sessionStorage.setItem(PENDING_FOLLOW_KEY, JSON.stringify({
+        title,
+        at: Date.now(),
+      }));
+    } catch { /* private mode — search page will just sit there */ }
+
+    setStatus(`Searching laptop for: ${title}`, 'busy');
+    location.href = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+  }
+
+  const PENDING_FOLLOW_KEY = 'stb-pending-follow';
+
+  /**
+   * Runs on the search-results page after followTvTrack navigated here: opens the
+   * first real video hit so the track actually plays, instead of leaving the user
+   * staring at a list of results.
+   */
+  function resumePendingFollow() {
+    if (!location.pathname.startsWith('/results')) return;
+
+    let pending = null;
+    try {
+      const raw = sessionStorage.getItem(PENDING_FOLLOW_KEY);
+      if (!raw) return;
+      pending = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    // Stale intent (tab left open, user searched something else later).
+    if (!pending?.title || Date.now() - (pending.at || 0) > 60000) {
+      try { sessionStorage.removeItem(PENDING_FOLLOW_KEY); } catch { /* */ }
+      return;
+    }
+
+    const deadline = Date.now() + 10000;
+    const tryClick = () => {
+      if (Date.now() > deadline) {
+        try { sessionStorage.removeItem(PENDING_FOLLOW_KEY); } catch { /* */ }
+        return;
+      }
+      // Skip ads/shelves — take the first genuine video renderer.
+      const hit = document.querySelector('ytd-video-renderer a#video-title[href*="/watch?v="]')
+        || document.querySelector('a#video-title[href*="/watch?v="]')
+        || document.querySelector('ytd-video-renderer a#thumbnail[href*="/watch?v="]');
+      if (hit) {
+        try { sessionStorage.removeItem(PENDING_FOLLOW_KEY); } catch { /* */ }
+        followingTvUntil = Date.now() + 12000;
+        hit.click();
+        return;
+      }
+      setTimeout(tryClick, 400);
+    };
+    tryClick();
   }
 
   /**
@@ -570,6 +955,12 @@
     if (playbackMode === 'tvOnly') {
       pauseLaptop();
       startKeepPaused();
+      // The laptop stays silent, but dragging YouTube's bar is still the way to
+      // seek the TV — so seek handling is bound here too.
+      bindLaptopSeekHandlers();
+      // Poll in TV-only too: we still need to notice when SmartTube moves to a new
+      // track so the tab can follow it.
+      startSyncPoll();
     } else if (playbackMode === 'synced') {
       // Both have audio; bridge keeps timelines glued.
       const v = getLaptopVideo();
@@ -580,12 +971,14 @@
       bindSyncedEndHandlers(getLaptopVideo());
       startSyncPoll();
     } else {
-      // Independent: no force pause / no sync loop.
+      // Independent: no force pause, no laptop control. The poll still runs, but
+      // only to keep the TV seek bar alive — see startSyncPoll's independent branch.
       resetLaptopRate();
       restoreLaptopAudio();
       const v = getLaptopVideo();
       if (v) v.loop = false;
       bindLaptopSeekHandlers(false);
+      startSyncPoll();
     }
     updateModeUi();
   }
@@ -621,6 +1014,45 @@
     }
   }
 
+  /**
+   * The user dragged YouTube's progress bar. The laptop is left exactly where they
+   * put it — we never fight the gesture — and the TV is sent after it.
+   *
+   * Seeking the TV means an `am start` VIEW intent, which restarts SmartTube's
+   * player (2-5s reload + buffer). So drift correction stays suppressed until the
+   * TV actually arrives near the target, then the guard is released early.
+   */
+  async function followUserSeek(targetSec) {
+    userSeekGuardUntil = Date.now() + 15000;
+    setStatus(`Seeking TV to ${formatTime(targetSec)}…`, 'busy');
+
+    try {
+      await pushSeekToTv(targetSec);
+    } catch (e) {
+      userSeekGuardUntil = 0;
+      setStatus(e?.message || 'TV seek failed', 'error');
+      return;
+    }
+
+    // Wait for SmartTube to come back up near the target, then resume drift work.
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if (!castingSession) { userSeekGuardUntil = 0; return; }
+      await sleep(700);
+      const s = await sampleTv();
+      if (!s) continue;
+      if (Math.abs(s.tvSec - targetSec) <= 4) {
+        userSeekGuardUntil = 0;   // TV is here — normal sync may resume
+        setStatus(`TV synced @ ${formatTime(s.tvSec)}`, 'ok');
+        return;
+      }
+    }
+
+    // Never leave the guard latched on; fall back to normal drift correction.
+    userSeekGuardUntil = 0;
+    setStatus('TV seek timed out — will re-sync', 'error');
+  }
+
   function bindLaptopSeekHandlers(enableLiveSync = true) {
     const v = getLaptopVideo();
     if (!v || v.dataset.stbSeekBound === '1') return;
@@ -631,25 +1063,23 @@
     const onUserSeek = () => {
       if (!castingSession || syncingFromTv || seekingUi || seekAlignInProgress) return;
       if (Date.now() < ignoreUserSeekUntil) return;
-      if (playbackMode === 'tvOnly') return;
+      // Independent means "only laptop" — the TV is not ours to move.
+      if (playbackMode === 'independent') return;
 
       const sec = laptopPositionSec();
       // Ignore tiny / duplicate seek events (YouTube fires many during buffer).
       if (lastUserSeekPos >= 0 && Math.abs(sec - lastUserSeekPos) < 1.25) return;
       lastUserSeekPos = sec;
 
+      // Hold off drift correction immediately — before the debounce — so a drag
+      // that spans several seconds never gets yanked back mid-gesture.
+      userSeekGuardUntil = Date.now() + 15000;
+
       clearTimeout(seekDebounce);
       seekDebounce = setTimeout(() => {
-        if (!castingSession || seekAlignInProgress || Date.now() < ignoreUserSeekUntil) return;
+        if (!castingSession || seekAlignInProgress) return;
         const now = laptopPositionSec();
-        if (playbackMode === 'synced') {
-          // Block the seeked storms that alignedSeek itself generates.
-          blockUserSeekEvents(5000);
-          alignedSeek(now, { label: 'Seek' });
-        } else {
-          pushSeekToTv(now);
-          updateSeekUi(now, laptopDurationSec());
-        }
+        followUserSeek(now);
       }, 400);
     };
 
@@ -657,11 +1087,78 @@
     v.addEventListener('seeked', onUserSeek);
   }
 
+  // Drift thresholds for correcting the laptop against the predicted TV clock.
+  // playbackRate is never touched — a previous attempt made laptop audio sound
+  // slow while the TV ran at normal speed, and was reverted.
+  const DRIFT_NUDGE_SEC = 0.75;
+  const DRIFT_HARD_SEC = 2.0;
+
+  /**
+   * While the user is driving the timeline the TV is the follower, not the master —
+   * correcting toward the TV here would drag the playhead straight back and make
+   * seeking impossible. Set by onUserSeek, cleared once the TV has caught up.
+   */
+  let userSeekGuardUntil = 0;
+
+  function userIsDrivingSeek() {
+    return Date.now() < userSeekGuardUntil;
+  }
+
+  /** Pull the laptop back onto the TV's clock. Cheap: the laptop is the local side. */
+  function correctDrift(localSec) {
+    if (userIsDrivingSeek()) return;
+
+    const tvSec = predictedTvSec();
+    if (tvSec == null || !tvAnchorPlaying) return;
+
+    const delta = localSec - tvSec;
+    const mag = Math.abs(delta);
+    if (mag < DRIFT_NUDGE_SEC) return;
+    if (mag > 90) return;   // different track, not drift — leave it to the arbiter
+
+    // Short block: only enough to ignore the `seeked` this very call emits.
+    withRemotePauseGuard(() => seekLaptopSeconds(tvSec, { force: true, blockMs: 600 }));
+    if (mag >= DRIFT_HARD_SEC) {
+      setStatus(`Re-synced (${delta > 0 ? '+' : ''}${delta.toFixed(1)}s)`, 'ok');
+    }
+  }
+
   function startSyncPoll() {
     stopSyncPoll();
-    // Synced mode: pause mirror + continuous time bridge to TV.
+    // Runs in every mode while casting — track-change detection needs it even in
+    // "TV only". What it *does* is gated by mode below.
     syncPollTimer = setInterval(async () => {
-      if (!(castingSession && playbackMode === 'synced') || seekingUi || seekAlignInProgress) return;
+      if (!castingSession || seekingUi || seekAlignInProgress) return;
+
+      // TV only: laptop stays paused and muted, but its playhead is dragged along
+      // with the TV so YouTube's own progress bar shows where the TV actually is.
+      // Without this the bar sits frozen at 0:00 and gives no feedback at all.
+      if (playbackMode === 'tvOnly') {
+        const v0 = getLaptopVideo();
+        if (v0 && !v0.paused) withRemotePauseGuard(() => pauseLaptop({ mute: true }));
+        await sampleTv();
+
+        if (!userIsDrivingSeek()) {
+          const tvSec = predictedTvSec();
+          const local = laptopPositionSec();
+          if (tvSec != null && Math.abs(local - tvSec) > 1.5) {
+            withRemotePauseGuard(() => seekLaptopSeconds(tvSec, { force: true, blockMs: 600 }));
+            // seekTo can resume playback on some builds — keep it silent.
+            const v1 = getLaptopVideo();
+            if (v1 && !v1.paused) withRemotePauseGuard(() => pauseLaptop({ mute: true }));
+          }
+        }
+        return;
+      }
+
+      // Independent: the laptop is nobody's business but YouTube's. Still sample the
+      // TV so the TV seek bar stays live — read-only, no laptop control at all.
+      if (playbackMode === 'independent') {
+        await sampleTv();
+        return;
+      }
+
+      if (playbackMode !== 'synced') return;
 
       const local = laptopPositionSec();
       const dur = laptopDurationSec();
@@ -685,10 +1182,9 @@
       if (Date.now() - lastSeekPushMs < 2000) return;
 
       try {
-        const resp = await api('position', {});
-        const d = resp?.data;
-        if (!d?.available) return;
-        const tvSec = (d.positionMs || 0) / 1000;
+        const d = await sampleTv();
+        if (!d) return;
+        const tvSec = d.tvSec;
 
         // SmartTube jumped to Related at t≈0 — hold TV, never rewind browser.
         if (!nearEnd && !tvHeldAtEnd && !endHandled && local > 12 && tvSec < 4) {
@@ -719,12 +1215,13 @@
           return;
         }
 
-        // Constant bridge while both playing
+        // Both playing → keep the laptop pinned to the TV's clock.
         if (d.isPlaying && !laptopPaused && !syncedPaused) {
-          applyTimeBridge(local, tvSec, true);
+          resetLaptopRate();
+          correctDrift(local);
         }
       } catch { /* */ }
-    }, 1000);
+    }, 2000);
   }
 
   function stopSyncPoll() {
@@ -742,13 +1239,18 @@
     castInFlight = true;
     castingSession = true;
     lastVideoId = videoId;
+    // An explicit cast/recast is the user speaking from the laptop side.
+    if (!fromAuto) restoreLaptopAuthority('Playlist control restored');
     ensureSingleBar();
     updateBarCastingUi(true);
     applyModeBehavior();
     setStatus(fromAuto ? 'Auto-casting…' : 'Casting…', 'busy');
 
     try {
-      const cleanUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      // Pass the playlist through. Without &list= SmartTube has no queue context and
+      // falls back to its own "Related" autoplay — which is why the TV drifted onto
+      // different songs than the laptop's playlist. With it, both sides share a queue.
+      const cleanUrl = buildCastUrl(videoId);
       const resp = await api('cast', { url: cleanUrl, mode: playbackMode });
       if (resp?.success === false) {
         setStatus(resp.message || 'Cast failed', 'error');
@@ -784,6 +1286,10 @@
     await chrome.storage.sync.set({ castingSession: false });
     stopKeepPaused();
     stopSyncPoll();
+    resetTvClock();
+    lastTvTitle = null;
+    masterSide = null;
+    masterUntil = 0;
     resetLaptopRate();
     restoreLaptopAudio();
     updateBarCastingUi(false);
@@ -791,16 +1297,44 @@
   }
 
   /**
-   * Re-align after drift: pause laptop at current spot, re-seek TV there,
-   * wait for TV settle delay, then start both together.
+   * Sync = snap the LAPTOP to the TV, not the other way round.
+   *
+   * Seeking the TV means firing a VIEW intent, which restarts SmartTube's player
+   * (2-5s reload + buffer) — that is why the old direction felt broken. Seeking the
+   * laptop is local and completes in well under 100ms, so this is the cheap side to
+   * move. The TV is only ever re-seeked on an explicit drag of the YouTube bar.
    */
   async function syncNow() {
     if (!castingSession) {
       setStatus('Cast first, then Sync', 'error');
       return;
     }
-    const sec = laptopPositionSec();
-    await alignedSeek(sec, { label: 'Sync' });
+
+    setStatus('Syncing to TV…', 'busy');
+    const sample = await sampleTv();
+    if (!sample) {
+      setStatus('TV position unavailable', 'error');
+      return;
+    }
+
+    const target = predictedTvSec() ?? sample.tvSec;
+    blockUserSeekEvents(2500);
+    withRemotePauseGuard(() => seekLaptopSeconds(target, { force: true }));
+    restoreLaptopAudio();
+
+    // Match the TV's play/pause state too, so "synced" really means synced.
+    if (playbackMode === 'synced') {
+      const v = getLaptopVideo();
+      if (sample.isPlaying && v?.paused) {
+        syncedPaused = false;
+        withRemotePauseGuard(() => playLaptop());
+      } else if (!sample.isPlaying && v && !v.paused) {
+        syncedPaused = true;
+        withRemotePauseGuard(() => pauseLaptop({ mute: false }));
+      }
+    }
+
+    setStatus(`Synced to TV @ ${formatTime(target)}`, 'ok');
   }
 
   function setStatus(text, kind) {
@@ -810,19 +1344,29 @@
     el.dataset.kind = kind || '';
   }
 
+  // null until the first paint, so the initial state is always applied once.
+  let lastCastingUiState = null;
+
   function updateBarCastingUi(on) {
     const bar = document.getElementById(BAR_ID);
     if (!bar) return;
     bar.classList.toggle('stb-casting', !!on);
+
+    // Default state follows the casting state: expanded while casting, collapsed on
+    // "only laptop" — applied on the first paint of a page and on each real change.
+    // It must NOT re-apply on every refresh tick (this runs every 1.5s), or a manual
+    // collapse would spring back open a moment later.
+    if (lastCastingUiState !== !!on) {
+      lastCastingUiState = !!on;
+      setBarCollapsed(!on);
+    }
     const castBtn = bar.querySelector('[data-stb="cast"]');
     const stopBtn = bar.querySelector('[data-stb="stop"]');
     const syncBtn = bar.querySelector('[data-stb="sync"]');
-    const seekWrap = bar.querySelector('.stb-seek-wrap');
     const delayWrap = bar.querySelector('.stb-delay-wrap');
     if (castBtn) castBtn.textContent = on ? '↻ Recast' : '📺 Play on TV';
     if (stopBtn) stopBtn.classList.toggle('stb-hidden', !on);
     if (syncBtn) syncBtn.classList.toggle('stb-hidden', !on);
-    if (seekWrap) seekWrap.classList.toggle('stb-hidden', !on);
     if (delayWrap) delayWrap.classList.toggle('stb-hidden', !on);
     updateDelayUi();
   }
@@ -832,15 +1376,159 @@
     if (sel && sel.value !== playbackMode) sel.value = playbackMode;
   }
 
-  function updateSeekUi(posSec, durSec) {
-    const slider = document.getElementById('stb-seek');
-    const label = document.getElementById('stb-seek-label');
-    if (!slider || seekingUi) return;
-    const dur = Math.max(1, Math.floor(durSec || Number(slider.max) || 1));
-    slider.max = String(dur);
-    slider.value = String(Math.floor(Math.min(dur, Math.max(0, posSec || 0))));
-    if (label) label.textContent = `${formatTime(posSec)} / ${formatTime(dur)}`;
+  /**
+   * Collapsed by default on every load. Casting expands it; stopping ("only laptop")
+   * collapses it again. Manual toggles last for the current page only.
+   */
+  function setBarCollapsed(collapsed) {
+    const bar = document.getElementById(BAR_ID);
+    if (!bar) return;
+    bar.classList.toggle('stb-collapsed', !!collapsed);
+    const btn = bar.querySelector('[data-stb="toggle"]');
+    if (btn) {
+      btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+      btn.title = collapsed ? 'Expand SmartTube controls' : 'Collapse SmartTube controls';
+      const chev = btn.querySelector('.stb-chevron');
+      if (chev) chev.textContent = collapsed ? '▸' : '▾';
+    }
   }
+
+  // ── TV seek bar ────────────────────────────────────────────────────────────
+  // Reflects the TV's own clock (dead-reckoned between samples) and seeks the TV.
+  let tvBarTimer = null;
+  let tvBarDragging = false;
+  let tvBarDurationSec = 0;
+
+  function bindTvSeekBar(bar) {
+    const slider = bar.querySelector('#stb-tvseek');
+    const tip = bar.querySelector('#stb-tvseek-tip');
+    if (!slider) return;
+
+    const valueToSec = () => (Number(slider.value) / 1000) * (tvBarDurationSec || 0);
+
+    const startDrag = () => { tvBarDragging = true; };
+    slider.addEventListener('mousedown', startDrag);
+    slider.addEventListener('touchstart', startDrag, { passive: true });
+
+    slider.addEventListener('input', () => {
+      tvBarDragging = true;
+      const label = document.getElementById('stb-tvseek-label');
+      if (label) label.textContent = `${formatTime(valueToSec())} / ${formatTime(tvBarDurationSec)}`;
+    });
+
+    const commit = async () => {
+      if (!tvBarDragging) return;
+      tvBarDragging = false;
+      if (!castingSession) { setStatus('Cast first', 'error'); return; }
+
+      const target = valueToSec();
+      // Keep the laptop aligned too when both are meant to play together.
+      if (playbackMode === 'synced') {
+        blockUserSeekEvents(2000);
+        withRemotePauseGuard(() => seekLaptopSeconds(target, { force: true, blockMs: 1200 }));
+      }
+      await followUserSeek(target);
+    };
+    slider.addEventListener('change', commit);
+    slider.addEventListener('mouseup', commit);
+    slider.addEventListener('touchend', commit);
+
+    const showTip = (e) => {
+      if (!tip) return;
+      const rect = slider.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      tip.textContent = formatTime(ratio * (tvBarDurationSec || 0));
+      tip.style.left = `${ratio * 100}%`;
+      tip.classList.remove('stb-hidden');
+    };
+    slider.addEventListener('mousemove', showTip);
+    slider.addEventListener('mouseenter', showTip);
+    slider.addEventListener('mouseleave', () => tip?.classList.add('stb-hidden'));
+
+    startTvBarTicker();
+  }
+
+  /**
+   * Repaints from the predicted TV clock at 4Hz. This is local arithmetic, not an
+   * ADB round trip — the bar stays smooth while the poll stays at 2s.
+   */
+  function startTvBarTicker() {
+    clearInterval(tvBarTimer);
+    tvBarTimer = setInterval(() => {
+      if (contextDead) return;
+      const slider = document.getElementById('stb-tvseek');
+      const label = document.getElementById('stb-tvseek-label');
+      if (!slider || tvBarDragging) return;
+
+      // SmartTube's media session does not report duration, so use the laptop's
+      // copy of the same video — the two are the same media.
+      const dur = laptopDurationSec();
+      if (dur > 0) tvBarDurationSec = dur;
+
+      const tvSec = predictedTvSec();
+      if (tvSec == null || !tvBarDurationSec) {
+        if (label) label.textContent = castingSession ? '—:— / —:—' : '0:00 / 0:00';
+        return;
+      }
+
+      const clamped = Math.min(tvBarDurationSec, Math.max(0, tvSec));
+      slider.value = String(Math.round((clamped / tvBarDurationSec) * 1000));
+      if (label) label.textContent = `${formatTime(clamped)} / ${formatTime(tvBarDurationSec)}`;
+    }, 250);
+  }
+
+  function injectCollapseStyles() {
+    if (document.getElementById('stb-collapse-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'stb-collapse-styles';
+    style.textContent = `
+      #${BAR_ID} .stb-toggle {
+        display: inline-flex; align-items: center; gap: 6px;
+        background: transparent; border: 1px solid rgba(255,255,255,.25);
+        border-radius: 999px; color: inherit; cursor: pointer;
+        padding: 2px 8px; font-size: 12px; line-height: 1.6;
+      }
+      #${BAR_ID} .stb-toggle:hover { background: rgba(255,255,255,.10); }
+      #${BAR_ID} .stb-dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: #888; display: inline-block;
+      }
+      #${BAR_ID}.stb-casting .stb-dot { background: #3ea6ff; }
+      #${BAR_ID}.stb-collapsed { padding-top: 4px; padding-bottom: 4px; }
+      #${BAR_ID}.stb-collapsed > *:not(.stb-toggle):not(.stb-title) { display: none !important; }
+
+      #${BAR_ID} .stb-tvseek-wrap {
+        display: flex; align-items: center; gap: 8px;
+        flex: 1 1 100%; min-width: 240px; margin-top: 6px;
+      }
+      #${BAR_ID} .stb-tvseek-tag {
+        font-size: 11px; font-weight: 600; letter-spacing: .04em;
+        opacity: .8; min-width: 20px;
+      }
+      #${BAR_ID} .stb-tvseek-track { position: relative; flex: 1; display: flex; }
+      #${BAR_ID} .stb-tvseek-track input { width: 100%; flex: 1; cursor: pointer; }
+      #${BAR_ID} .stb-tvseek-tip {
+        position: absolute; bottom: 20px; transform: translateX(-50%);
+        background: rgba(0,0,0,.9); color: #fff; font-size: 11px;
+        padding: 2px 6px; border-radius: 3px; pointer-events: none; white-space: nowrap;
+      }
+      #${BAR_ID} .stb-tvseek-label {
+        font-size: 11px; opacity: .85; min-width: 84px; text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      /* Nothing to seek until a cast session exists. */
+      #${BAR_ID}:not(.stb-casting) .stb-tvseek-wrap { opacity: .45; pointer-events: none; }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  /**
+   * The custom seek slider was removed in favour of YouTube's native progress bar
+   * (thumbnail preview, chapters, hover scrub — all free, and always in step with
+   * the real video). Kept as a no-op so the many existing call sites stay valid.
+   */
+  function updateSeekUi(_posSec, _durSec) { /* no-op — YouTube owns the seek bar */ }
 
   function bindHoldRepeat(btn, endpoint) {
     const start = (e) => {
@@ -932,7 +1620,13 @@
 
     bar = document.createElement('div');
     bar.id = BAR_ID;
+    // Always start collapsed — expanded state is deliberately not persisted, so
+    // every page load / refresh comes up as a small pill.
+    bar.classList.add('stb-collapsed');
     bar.innerHTML = `
+      <button type="button" class="stb-toggle" data-stb="toggle" title="Expand SmartTube controls" aria-expanded="false">
+        <span class="stb-dot"></span><span class="stb-chevron">▸</span>
+      </button>
       <span class="stb-title">SmartTube</span>
       <button type="button" class="stb-btn stb-primary" data-stb="cast">📺 Play on TV</button>
       <button type="button" class="stb-btn stb-danger stb-hidden" data-stb="stop">■ Stop Casting</button>
@@ -944,6 +1638,9 @@
       <button type="button" class="stb-btn" data-stb-hold="volume/down">🔉</button>
       <button type="button" class="stb-btn" data-stb-media="volume/mute">🔇</button>
       <button type="button" class="stb-btn" data-stb-hold="volume/up">🔊</button>
+      <span class="stb-sep"></span>
+      <button type="button" class="stb-btn" data-stb-media="power/on" title="Turn TV on / wake">⏻</button>
+      <button type="button" class="stb-btn" data-stb-media="power/off" title="Turn TV off / sleep">⏼</button>
       <span class="stb-status" id="stb-status"></span>
       <div class="stb-mode-wrap">
         <label for="stb-mode">Mode</label>
@@ -980,15 +1677,23 @@
           <span class="stb-delay-label" id="stb-delay-label">4.2s</span>
         </div>
       </div>
-      <div class="stb-seek-wrap stb-hidden">
-        <span>Seek</span>
-        <div class="stb-seek-track">
-          <input id="stb-seek" type="range" min="0" max="100" value="0">
-          <div id="stb-seek-tip" class="stb-seek-tip stb-hidden">0:00</div>
+      <div class="stb-tvseek-wrap">
+        <span class="stb-tvseek-tag">TV</span>
+        <div class="stb-tvseek-track">
+          <input id="stb-tvseek" type="range" min="0" max="1000" value="0" step="1">
+          <div id="stb-tvseek-tip" class="stb-tvseek-tip stb-hidden">0:00</div>
         </div>
-        <span class="stb-seek-label" id="stb-seek-label">0:00 / 0:00</span>
+        <span class="stb-tvseek-label" id="stb-tvseek-label">0:00 / 0:00</span>
       </div>
     `;
+
+    // In synced mode YouTube's own bar drives both sides (it has thumbnail preview,
+    // chapters and hover scrub). In TV-only / independent the laptop video is not the
+    // reference, so this bar mirrors the TV clock and seeks the TV directly.
+    injectCollapseStyles();
+    bindTvSeekBar(bar);
+    const toggleBtn = bar.querySelector('[data-stb="toggle"]');
+    toggleBtn.addEventListener('click', () => setBarCollapsed(!bar.classList.contains('stb-collapsed')));
 
     bar.querySelector('[data-stb="cast"]').addEventListener('click', () => castCurrent());
     bar.querySelector('[data-stb="stop"]').addEventListener('click', () => stopCasting());
@@ -1079,45 +1784,8 @@
       setStatus(`Settle ${(seekDelayMs / 1000).toFixed(1)}s`, 'ok');
     });
 
-    const seek = bar.querySelector('#stb-seek');
-    const tip = bar.querySelector('#stb-seek-tip');
-    const commitSeek = async () => {
-      const sec = Number(seek.value) || 0;
-      updateSeekUi(sec, Number(seek.max) || laptopDurationSec());
-      clearTimeout(seekDebounce);
-      seekDebounce = setTimeout(async () => {
-        if (playbackMode === 'synced') {
-          await alignedSeek(sec, { label: 'Seek' });
-        } else {
-          await pushSeekToTv(sec);
-          seekingUi = false;
-        }
-      }, 80);
-    };
-    seek.addEventListener('mousedown', () => { seekingUi = true; });
-    seek.addEventListener('touchstart', () => { seekingUi = true; }, { passive: true });
-    seek.addEventListener('input', () => {
-      seekingUi = true;
-      updateSeekUi(Number(seek.value), Number(seek.max));
-    });
-    seek.addEventListener('change', commitSeek);
-    seek.addEventListener('mouseup', commitSeek);
-    seek.addEventListener('touchend', commitSeek);
-
-    const showTip = (e) => {
-      if (!tip) return;
-      const rect = seek.getBoundingClientRect();
-      if (rect.width <= 0) return;
-      const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
-      const max = Number(seek.max) || laptopDurationSec() || 0;
-      const sec = ratio * max;
-      tip.textContent = formatTime(sec);
-      tip.style.left = `${ratio * 100}%`;
-      tip.classList.remove('stb-hidden');
-    };
-    seek.addEventListener('mousemove', showTip);
-    seek.addEventListener('mouseenter', showTip);
-    seek.addEventListener('mouseleave', () => tip?.classList.add('stb-hidden'));
+    // Seek controls intentionally absent — YouTube's native progress bar is the
+    // single seek surface. User drags reach the TV via bindLaptopSeekHandlers().
 
     return bar;
   }
@@ -1191,6 +1859,15 @@
       delete v.dataset.stbSyncedBound;
     });
     if (castingSession) {
+      // If this navigation happened *because* we are following the TV, the TV is
+      // already on this video. Re-casting would fire a VIEW intent and restart
+      // SmartTube's player for no reason — just re-anchor and let it play.
+      if (Date.now() < followingTvUntil) {
+        setStatus('Following TV', 'ok');
+        resetTvClock();
+        applyModeBehavior();
+        return;
+      }
       // Pause TV briefly so SmartTube cannot keep playing its own Related during nav.
       if (playbackMode === 'synced') await pauseTv();
       await castCurrent({ fromAuto: true });
@@ -1204,13 +1881,22 @@
       const id = extractVideoId();
       if (id !== lastVideoId) {
         lastVideoId = id;
+        // Laptop moved to a new track. If the TV already owns this transition we're
+        // only following it — otherwise the laptop claims master and drives the TV.
+        // A navigation the user made themselves (not one we triggered to follow the
+        // TV) means they are driving from the laptop again.
+        if (Date.now() >= followingTvUntil) restoreLaptopAuthority();
+        if (!masterLockHeldBy('laptop')) claimMaster('laptop');
+        resetTvClock();
+        // A new video counts as a new page: re-apply the default collapse state.
+        lastCastingUiState = null;
         onVideoChanged(id);
       } else {
         ensureSingleBar();
       }
     };
     tick();
-    setInterval(tick, 1500);
+    navTickTimer = setInterval(tick, 1500);
     const onNav = () => tick();
     document.addEventListener('yt-navigate-finish', onNav);
     window.addEventListener('yt-navigate-finish', onNav);
@@ -1313,6 +1999,10 @@
   });
 
   async function init() {
+    // Search-results pages carry no player bar, but they may be the landing point of
+    // a TV-follow that still needs its top hit opened.
+    resumePendingFollow();
+
     const stored = await chrome.storage.sync.get({
       castingSession: false,
       playbackMode: 'tvOnly',

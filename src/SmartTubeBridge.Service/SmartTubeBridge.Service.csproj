@@ -14,4 +14,7 @@
   <ItemGroup>
     <ProjectReference Include="..\SmartTubeBridge.Shared\SmartTubeBridge.Shared.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="SmartTubeBridge.Service.Tests" />
+  </ItemGroup>
 </Project>

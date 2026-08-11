@@ -427,14 +427,20 @@ public partial class AdbService : IAdbService, IDisposable
     public async Task<PlaybackPosition?> GetPlaybackPositionAsync(string serial, CancellationToken ct = default)
     {
         EnsureRunning();
+
+        // One round trip for both the device clock and the session dump. /proc/uptime's first
+        // field shares the clock domain of PlaybackState's `updated=` (elapsedRealtime), so the
+        // two can be subtracted directly to get snapshot staleness.
         var (_, output) = await RunAsync(
-            $"-s {serial} shell {QuoteForAdbShell("dumpsys media_session")}", ct);
+            $"-s {serial} shell {QuoteForAdbShell("cat /proc/uptime; dumpsys media_session")}", ct);
 
         if (string.IsNullOrWhiteSpace(output))
             return null;
 
-        // Prefer SmartTube's media session, then any PlaybackState.
         var lines = output.Split('\n');
+        var deviceNowMs = ParseUptimeMs(lines);
+
+        // Prefer SmartTube's media session, then any PlaybackState.
         for (var i = 0; i < lines.Length; i++)
         {
             if (!lines[i].Contains("package=org.smarttube", StringComparison.OrdinalIgnoreCase) &&
@@ -448,52 +454,159 @@ public partial class AdbService : IAdbService, IDisposable
                 if (!lines[j].Contains("state=PlaybackState", StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                var position = ParsePlaybackPosition(lines[j]);
-                if (position is null) continue;
+                var parsed = ParsePlaybackState(lines[j], deviceNowMs);
+                if (parsed is null) continue;
 
-                var isPlaying = lines[j].Contains("PLAYING", StringComparison.OrdinalIgnoreCase)
-                    || lines[j].Contains("state=3")
-                    || lines[j].Contains("(3)");
-                var buffering = lines[j].Contains("BUFFERING", StringComparison.OrdinalIgnoreCase);
+                parsed.Package = lines[i].Contains("org.smarttube", StringComparison.OrdinalIgnoreCase)
+                    ? "org.smarttube.stable"
+                    : null;
 
-                return new PlaybackPosition
-                {
-                    PositionMs = Math.Max(0, position.Value),
-                    DurationMs = 0,
-                    IsPlaying = isPlaying || buffering,
-                    Package = lines[i].Contains("org.smarttube", StringComparison.OrdinalIgnoreCase)
-                        ? "org.smarttube.stable"
-                        : null
-                };
+                // metadata line sits a few rows below state= inside the same session block.
+                ApplyMetadata(parsed, lines, j);
+                return parsed;
             }
         }
 
         // Fallback: first PlaybackState with a non-zero/reasonable position
-        foreach (var line in lines)
+        for (var i = 0; i < lines.Length; i++)
         {
-            if (!line.Contains("state=PlaybackState", StringComparison.OrdinalIgnoreCase))
+            if (!lines[i].Contains("state=PlaybackState", StringComparison.OrdinalIgnoreCase))
                 continue;
-            var position = ParsePlaybackPosition(line);
-            if (position is null || position < 0) continue;
-            return new PlaybackPosition
-            {
-                PositionMs = position.Value,
-                DurationMs = 0,
-                IsPlaying = line.Contains("PLAYING", StringComparison.OrdinalIgnoreCase),
-                Package = null
-            };
+            var parsed = ParsePlaybackState(lines[i], deviceNowMs);
+            if (parsed is null) continue;
+            ApplyMetadata(parsed, lines, i);
+            return parsed;
         }
 
         return null;
     }
 
-    private static long? ParsePlaybackPosition(string line)
+    /// <summary>
+    /// Absurdity bound on snapshot age. SmartTube pushes state updates rarely — an 82s-old
+    /// snapshot on a genuinely playing session was observed and is legitimate — so this is
+    /// deliberately generous and is not the primary guard. The real discriminator is the
+    /// state field: an idle session reports NONE/PAUSED while leaving speed=1.0 behind.
+    /// </summary>
+    private const long MaxExtrapolationMs = 900_000;
+
+    /// <summary>First field of /proc/uptime, in ms. 0 when unavailable.</summary>
+    internal static long ParseUptimeMs(string[] lines)
     {
-        // Supports: position=120000  or  position=-37
-        var m = Regex.Match(line, @"position=(-?\d+)");
-        if (!m.Success) return null;
-        if (!long.TryParse(m.Groups[1].Value, out var v)) return null;
-        return v < 0 ? 0 : v;
+        foreach (var line in lines)
+        {
+            var m = Regex.Match(line.Trim(), @"^(\d+(?:\.\d+)?)\s+\d+(?:\.\d+)?\s*$");
+            if (!m.Success) continue;
+            if (double.TryParse(m.Groups[1].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+                return (long)Math.Round(seconds * 1000);
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Parses a PlaybackState dump line and extrapolates the snapshot to "now".
+    /// Real line shape (Acer R4_GTV / SmartTube):
+    ///   state=PlaybackState {state=PLAYING(3), position=10021, buffered position=15680,
+    ///   speed=1.0, updated=312846862, actions=2360191, ...}
+    /// </summary>
+    internal static PlaybackPosition? ParsePlaybackState(string line, long deviceNowMs)
+    {
+        // "buffered position=" also matches a bare `position=`, so anchor on the word boundary.
+        var posMatch = Regex.Match(line, @"(?<!buffered )\bposition=(-?\d+)");
+        if (!posMatch.Success) return null;
+        if (!long.TryParse(posMatch.Groups[1].Value, out var rawPosition)) return null;
+        if (rawPosition < 0) rawPosition = 0;
+
+        var speed = 0.0;
+        var speedMatch = Regex.Match(line, @"\bspeed=(-?\d+(?:\.\d+)?)");
+        if (speedMatch.Success)
+            double.TryParse(speedMatch.Groups[1].Value,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out speed);
+
+        long updatedMs = 0;
+        var updatedMatch = Regex.Match(line, @"\bupdated=(\d+)");
+        if (updatedMatch.Success)
+            long.TryParse(updatedMatch.Groups[1].Value, out updatedMs);
+
+        var isPlaying = line.Contains("PLAYING", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("state=3")
+            || line.Contains("(3)");
+        var buffering = line.Contains("BUFFERING", StringComparison.OrdinalIgnoreCase);
+
+        // Staleness is only meaningful when both clocks are known and consistent.
+        long staleness = 0;
+        if (deviceNowMs > 0 && updatedMs > 0 && deviceNowMs >= updatedMs)
+            staleness = deviceNowMs - updatedMs;
+
+        // Extrapolate only when the snapshot is both live and recent.
+        //
+        // An idle SmartTube session keeps its last PlaybackState around with speed=1.0 still
+        // set, so a naive extrapolation turns an hours-old snapshot into an absurd position
+        // (observed: raw=0, staleness=4911528ms -> 82 minutes). Trust the state field over
+        // speed, and refuse to extrapolate across an implausible gap.
+        var trustworthy = isPlaying
+            && speed > 0
+            && staleness > 0
+            && staleness <= MaxExtrapolationMs;
+
+        var extrapolated = trustworthy
+            ? rawPosition + (long)Math.Round(staleness * speed)
+            : rawPosition;
+        if (extrapolated < 0) extrapolated = 0;
+
+        return new PlaybackPosition
+        {
+            PositionMs = extrapolated,
+            RawPositionMs = rawPosition,
+            StalenessMs = staleness,
+            Speed = speed,
+            DurationMs = 0,
+            IsPlaying = isPlaying || buffering
+        };
+    }
+
+    /// <summary>
+    /// Pulls Title/Artist off the session's metadata line, e.g.
+    ///   metadata: size=6, description=Song Title (Official Video), Artist Name, null
+    /// The trailing field is usually "null"; the title itself may contain commas, so the
+    /// artist is taken from the end rather than the title from the start.
+    /// </summary>
+    internal static void ApplyMetadata(PlaybackPosition target, string[] lines, int stateLineIndex)
+    {
+        for (var k = stateLineIndex; k < Math.Min(stateLineIndex + 10, lines.Length); k++)
+        {
+            // Stop at the next session block so we never borrow another app's metadata.
+            if (k > stateLineIndex && lines[k].Contains("state=PlaybackState", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var m = Regex.Match(lines[k], @"metadata:.*?description=(.*)$");
+            if (!m.Success) continue;
+
+            var raw = m.Groups[1].Value.Trim();
+            if (raw.Length == 0 || raw.Equals("null", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var parts = raw.Split(", ").ToList();
+            // Drop the trailing album slot when it carries no value.
+            if (parts.Count > 1 && parts[^1].Equals("null", StringComparison.OrdinalIgnoreCase))
+                parts.RemoveAt(parts.Count - 1);
+
+            if (parts.Count >= 2)
+            {
+                target.Artist = parts[^1].Trim();
+                target.Title = string.Join(", ", parts.Take(parts.Count - 1)).Trim();
+            }
+            else if (parts.Count == 1)
+            {
+                target.Title = parts[0].Trim();
+            }
+
+            if (string.Equals(target.Title, "null", StringComparison.OrdinalIgnoreCase)) target.Title = null;
+            if (string.Equals(target.Artist, "null", StringComparison.OrdinalIgnoreCase)) target.Artist = null;
+            return;
+        }
     }
 
     public async Task<bool> TestConnectionAsync(CancellationToken ct = default)

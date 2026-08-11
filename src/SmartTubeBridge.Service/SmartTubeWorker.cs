@@ -1,3 +1,4 @@
+using SmartTubeBridge.Shared.Enums;
 using SmartTubeBridge.Shared.Interfaces;
 
 namespace SmartTubeBridge.Service;
@@ -57,8 +58,7 @@ public class SmartTubeWorker : BackgroundService
 
             _log.Info("Worker", "SmartTube Bridge Service started successfully");
 
-            // Keep the worker alive until shutdown.
-            await Task.Delay(Timeout.Infinite, stoppingToken);
+            await RunReconnectWatchdogAsync(stoppingToken);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -68,6 +68,62 @@ public class SmartTubeWorker : BackgroundService
         {
             _log.Error("Worker", "Background worker failed", ex);
             // Do not rethrow — keep API alive even if ADB setup failed.
+        }
+    }
+
+    /// <summary>
+    /// ADB-over-TCP drops whenever the TV sleeps, changes network, or the link hiccups, and
+    /// nothing brings it back on its own — before this, a single drop meant "TV disconnected"
+    /// until someone restarted the service. Poll the device list and reconnect saved devices
+    /// whenever nothing is connected.
+    /// </summary>
+    private async Task RunReconnectWatchdogAsync(CancellationToken stoppingToken)
+    {
+        var interval = TimeSpan.FromSeconds(20);
+        var wasConnected = _devices.PreferredDevice?.State == DeviceConnectionState.Connected;
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(interval, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                // Refresh first: `adb devices` is what marks a dead tcpip link as gone.
+                await _devices.RefreshAsync(stoppingToken);
+
+                var connected = _devices.KnownDevices.Any(d => d.State == DeviceConnectionState.Connected);
+
+                if (connected)
+                {
+                    if (!wasConnected)
+                        _log.Info("Watchdog", "Device connection restored");
+                    wasConnected = true;
+                    continue;
+                }
+
+                if (wasConnected)
+                    _log.Warning("Watchdog", "Device connection lost — attempting to reconnect");
+                wasConnected = false;
+
+                if (_config.Config.SavedDevices.Count > 0)
+                    await _devices.AutoConnectAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                // Never let a transient ADB failure kill the watchdog.
+                _log.Warning("Watchdog", $"Reconnect attempt failed: {ex.Message}");
+            }
         }
     }
 

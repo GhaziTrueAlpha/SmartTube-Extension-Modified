@@ -121,10 +121,39 @@ public class MediaController : ControllerBase
         {
             available = true,
             positionMs = pos.PositionMs,
+            rawPositionMs = pos.RawPositionMs,
+            stalenessMs = pos.StalenessMs,
+            speed = pos.Speed,
             durationMs = pos.DurationMs,
             isPlaying = pos.IsPlaying,
-            package = pos.Package
+            package = pos.Package,
+            title = pos.Title,
+            artist = pos.Artist
         }));
+    }
+
+    /// <summary>Wake the TV (KEYCODE_WAKEUP — safe to send when already on).</summary>
+    [HttpPost("power/on")]
+    public async Task<ActionResult<ApiResponse>> PowerOn([FromBody] MediaCommand? cmd = null)
+    {
+        await _media.WakeAsync(DeviceId(cmd));
+        return Ok(ApiResponse.Ok(message: "TV on"));
+    }
+
+    /// <summary>Put the TV to sleep (KEYCODE_SLEEP — idempotent, unlike POWER).</summary>
+    [HttpPost("power/off")]
+    public async Task<ActionResult<ApiResponse>> PowerOff([FromBody] MediaCommand? cmd = null)
+    {
+        await _media.ExecuteAsync(MediaAction.Sleep, DeviceId(cmd));
+        return Ok(ApiResponse.Ok(message: "TV off"));
+    }
+
+    /// <summary>Toggle power (KEYCODE_POWER).</summary>
+    [HttpPost("power/toggle")]
+    public async Task<ActionResult<ApiResponse>> PowerToggle([FromBody] MediaCommand? cmd = null)
+    {
+        await _media.ExecuteAsync(MediaAction.Power, DeviceId(cmd));
+        return Ok(ApiResponse.Ok(message: "Power toggled"));
     }
 
     [HttpPost("home")]

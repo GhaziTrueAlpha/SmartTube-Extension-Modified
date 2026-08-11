@@ -58,7 +58,9 @@ public class MediaCommandService : IMediaCommandService
 
         _log.Info("Media", $"Executing {action} on {device.FriendlyName}");
 
-        if (action is MediaAction.Power or MediaAction.Sleep or MediaAction.PlayPause or MediaAction.Play or MediaAction.Pause or MediaAction.Next or MediaAction.Previous or MediaAction.FastForward or MediaAction.Rewind or MediaAction.Stop)
+        // Power/Sleep must NOT be preceded by a wake — waking the device first and
+        // then sending Sleep either cancels the intent or toggles it straight back on.
+        if (action is MediaAction.PlayPause or MediaAction.Play or MediaAction.Pause or MediaAction.Next or MediaAction.Previous or MediaAction.FastForward or MediaAction.Rewind or MediaAction.Stop)
         {
             await _adb.WakeDeviceAsync(device.Serial, ct);
         }
@@ -67,6 +69,17 @@ public class MediaCommandService : IMediaCommandService
         {
             await _adb.SendKeyEventAsync(device.Serial, keyCode, ct);
         }
+    }
+
+    /// <summary>Wake the device without sending any media key after it.</summary>
+    public async Task WakeAsync(string? deviceId = null, CancellationToken ct = default)
+    {
+        var device = ResolveDevice(deviceId);
+        if (device == null)
+            throw new DeviceNotConnectedException("No device connected");
+
+        _log.Info("Media", $"Waking {device.FriendlyName}");
+        await _adb.WakeDeviceAsync(device.Serial, ct);
     }
 
     private string? _lastVideoId;
