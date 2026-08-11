@@ -341,46 +341,150 @@ public partial class AdbService : IAdbService, IDisposable
         await Task.Delay(_config.Config.WakeDelayMs, ct);
     }
 
+    /// <summary>Keycodes sent per ADB call. Keeps the shell command well under any length limit.</summary>
+    private const int VolumeStepsPerCall = 25;
+
+    /// <summary>Guards against a pathological target turning into hundreds of key presses.</summary>
+    private const int MaxVolumeSteps = 120;
+
+    /// <summary>
+    /// Reads STREAM_MUSIC volume. Output shape on Android TV:
+    ///   [V] volume is 45 in range [0..100]
+    /// </summary>
+    public async Task<VolumeInfo?> GetVolumeAsync(string serial, CancellationToken ct = default)
+    {
+        EnsureRunning();
+        var (_, output) = await RunAsync(
+            $"-s {serial} shell {QuoteForAdbShell("cmd media_session volume --stream 3 --get")}", ct);
+
+        if (string.IsNullOrWhiteSpace(output)) return null;
+
+        var m = Regex.Match(output, @"volume is (\d+) in range \[(\d+)\.\.(\d+)\]");
+        if (!m.Success)
+        {
+            // Some builds print only the level.
+            var bare = Regex.Match(output, @"volume is (\d+)");
+            if (!bare.Success || !int.TryParse(bare.Groups[1].Value, out var only)) return null;
+            return new VolumeInfo { Level = only, Min = 0, Max = 100 };
+        }
+
+        if (!int.TryParse(m.Groups[1].Value, out var level)) return null;
+        int.TryParse(m.Groups[2].Value, out var min);
+        if (!int.TryParse(m.Groups[3].Value, out var max) || max <= min) max = 100;
+
+        return new VolumeInfo { Level = level, Min = min, Max = max };
+    }
+
+    /// <summary>
+    /// Sets absolute volume by stepping with key events.
+    ///
+    /// Absolute set is NOT usable on this hardware: `cmd media_session volume --set`
+    /// reports "will set volume to index=N" and returns success, but the level never
+    /// changes (verified on Acer R4_GTV — set 30 while at 45 left it at 45). That
+    /// silent no-op is why the volume slider never worked. VOLUME_UP/DOWN key events
+    /// do apply, at exactly one unit per press, and `input keyevent` accepts several
+    /// keycodes per invocation — so a jump costs a couple of round trips, not one per
+    /// step.
+    /// </summary>
+    /// <summary>
+    /// Cancels the volume stepping still in flight, so a newer target supersedes it.
+    /// Reaching a distant level takes seconds; without this, an older request would
+    /// keep pressing VOLUME_UP toward a level the user has already moved away from.
+    /// </summary>
+    private CancellationTokenSource? _volumeCts;
+    private readonly object _volumeGate = new();
+
+    /// <summary>
+    /// Serialises volume operations. Cancelling alone is not enough: the read and the
+    /// stepping must not interleave with a previous request's key events, or the new
+    /// delta gets computed against a level that is still moving and the slider lands
+    /// short (observed: rapid 90/20/55 finished at 47).
+    /// </summary>
+    private readonly SemaphoreSlim _volumeLock = new(1, 1);
+
+    /// <summary>Settle time so key events already dispatched are reflected before we re-read.</summary>
+    private const int VolumeSettleMs = 250;
+
     public async Task SetVolumeAsync(string serial, int level, CancellationToken ct = default)
     {
         EnsureRunning();
-        level = Math.Clamp(level, 0, 15);
 
-        // Try common Android TV absolute-volume commands (MUSIC stream = 3).
-        var commands = new[]
+        // Latest request wins: stop whatever stepping is running, then queue behind it
+        // so it has fully unwound before we read the level.
+        lock (_volumeGate)
         {
-            $"cmd media_session volume --show --stream 3 --set {level}",
-            $"cmd media volume --show --stream 3 --set {level}",
-            $"media volume --show --stream 3 --set {level}",
-            $"settings put system volume_music_speaker {level}",
-            $"settings put system volume_music {level}",
-        };
-
-        foreach (var shellCmd in commands)
-        {
-            var (exitCode, output) = await RunAsync($"-s {serial} shell {shellCmd}", ct);
-            if (exitCode == 0 && !LooksLikeVolumeFailure(output))
-            {
-                _log.Info("ADB", $"Set volume on {serial} to {level} via: {shellCmd}");
-                return;
-            }
+            try { _volumeCts?.Cancel(); } catch (ObjectDisposedException) { }
         }
 
-        _log.Warning("ADB", $"Absolute volume failed on {serial}; stepping with keyevents to {level}");
-        for (var i = 0; i < 16; i++)
-            await SendKeyEventAsync(serial, KeyCodes.VolumeDown, ct);
-        for (var i = 0; i < level; i++)
-            await SendKeyEventAsync(serial, KeyCodes.VolumeUp, ct);
-    }
+        await _volumeLock.WaitAsync(ct);
 
-    private static bool LooksLikeVolumeFailure(string output)
-    {
-        if (string.IsNullOrWhiteSpace(output)) return false;
-        return output.Contains("Unknown command", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("not found", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("No such file", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("Exception", StringComparison.OrdinalIgnoreCase)
-            || output.Contains("Usage:", StringComparison.OrdinalIgnoreCase);
+        CancellationTokenSource cts;
+        lock (_volumeGate)
+        {
+            cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _volumeCts = cts;
+        }
+
+        var token = cts.Token;
+
+        try
+        {
+            // Let any key events from the superseded request land first.
+            await Task.Delay(VolumeSettleMs, token);
+
+            var current = await GetVolumeAsync(serial, token);
+            if (current is null)
+            {
+                _log.Warning("ADB", $"Cannot read volume on {serial}; skipping absolute set");
+                throw new SmartTubeBridgeException(
+                    "Could not read the TV's current volume.", "VOLUME_READ_FAILED");
+            }
+
+            var target = Math.Clamp(level, current.Min, current.Max);
+            var startedAt = current.Level;
+
+            // Two passes: step, then verify and close any residual gap. A single pass
+            // can undershoot when the device coalesces rapid key events.
+            for (var pass = 0; pass < 2; pass++)
+            {
+                var reading = pass == 0 ? current : await GetVolumeAsync(serial, token);
+                if (reading is null) break;
+
+                var delta = target - reading.Level;
+                if (delta == 0) break;
+
+                var steps = Math.Min(Math.Abs(delta), MaxVolumeSteps);
+                var keyCode = delta > 0 ? KeyCodes.VolumeUp : KeyCodes.VolumeDown;
+
+                for (var sent = 0; sent < steps; sent += VolumeStepsPerCall)
+                {
+                    // Checked between batches, so a superseded request stops within one
+                    // batch instead of driving all the way to a stale target.
+                    token.ThrowIfCancellationRequested();
+                    var batch = Math.Min(VolumeStepsPerCall, steps - sent);
+                    var codes = string.Join(' ', Enumerable.Repeat(keyCode.ToString(), batch));
+                    await RunAsync($"-s {serial} shell input keyevent {codes}", token);
+                }
+
+                await Task.Delay(VolumeSettleMs, token);
+            }
+
+            _log.Info("ADB", $"Volume {startedAt} -> {target} on {serial}");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Superseded by a newer target — expected, not a failure.
+            _log.Info("ADB", $"Volume set to {level} on {serial} superseded by a newer request");
+        }
+        finally
+        {
+            lock (_volumeGate)
+            {
+                if (ReferenceEquals(_volumeCts, cts)) _volumeCts = null;
+            }
+            cts.Dispose();
+            _volumeLock.Release();
+        }
     }
 
     public async Task SeekToAsync(string serial, long positionMs, string videoId, string package, CancellationToken ct = default)

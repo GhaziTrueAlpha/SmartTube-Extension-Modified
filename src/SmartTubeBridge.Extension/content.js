@@ -360,6 +360,7 @@
     clearTimeout(nextVideoTimer);
     clearTimeout(seekAlignTimer);
     clearInterval(tvBarTimer);
+    clearInterval(volumeRefreshTimer);
     if (navTickTimer) clearInterval(navTickTimer);
 
     // Leave the tab in a sane state rather than half-controlled.
@@ -1478,6 +1479,88 @@
     }, 250);
   }
 
+  // ── TV volume slider ───────────────────────────────────────────────────────
+  // The TV ignores absolute volume set, so the service steps VOLUME_UP/DOWN to
+  // reach the target. A 30-point move takes several seconds on the device, so the
+  // slider only commits on release — never while dragging — and refreshes its
+  // reading afterwards rather than assuming the write landed.
+  let volumeBusy = false;
+  let volumeRefreshTimer = null;
+  /** Newest slider target awaiting a send; null when nothing is queued. */
+  let pendingVolumeTarget = null;
+
+  function bindVolumeSlider(bar) {
+    const slider = bar.querySelector('#stb-vol');
+    const label = bar.querySelector('#stb-vol-label');
+    if (!slider) return;
+
+    slider.addEventListener('input', () => {
+      if (label) label.textContent = `${slider.value}%`;
+    });
+
+    /**
+     * Latest target wins. Moving the slider again while a set is still stepping
+     * must not be dropped — it records the new target and the running loop picks it
+     * up on its next pass. The service cancels its in-flight key stepping when the
+     * newer request arrives, so the TV never finishes travelling to a stale level.
+     */
+    const commit = async () => {
+      pendingVolumeTarget = Number(slider.value);
+      if (label) label.textContent = `${pendingVolumeTarget}%`;
+      if (volumeBusy) return;   // the active loop will consume the new target
+
+      volumeBusy = true;
+      try {
+        while (pendingVolumeTarget !== null && !contextDead) {
+          const target = pendingVolumeTarget;
+          pendingVolumeTarget = null;
+
+          const resp = await api('volume', { level: target });
+
+          // Moved again mid-flight — go round with the newer value instead of
+          // painting this now-stale result.
+          if (pendingVolumeTarget !== null) continue;
+
+          const d = resp?.data;
+          if (d && Number.isFinite(d.level)) {
+            slider.value = String(d.level);
+            if (label) label.textContent = `${d.level}%`;
+          } else if (label) {
+            label.textContent = `${target}%`;
+          }
+        }
+      } catch {
+        if (label) label.textContent = '!';
+      } finally {
+        volumeBusy = false;
+      }
+    };
+    slider.addEventListener('change', commit);
+
+    refreshVolume();
+    // The physical remote changes volume too — resync periodically so the slider
+    // is not lying about the TV's actual level.
+    clearInterval(volumeRefreshTimer);
+    volumeRefreshTimer = setInterval(refreshVolume, 15000);
+  }
+
+  async function refreshVolume() {
+    if (contextDead || volumeBusy || !castingSession) return;
+    const slider = document.getElementById('stb-vol');
+    const label = document.getElementById('stb-vol-label');
+    if (!slider || document.activeElement === slider) return;
+
+    try {
+      const resp = await api('volumeGet', {});
+      const d = resp?.data;
+      if (!d?.available) return;
+      slider.min = String(d.min ?? 0);
+      slider.max = String(d.max ?? 100);
+      slider.value = String(d.level);
+      if (label) label.textContent = `${d.level}%`;
+    } catch { /* leave the last known reading */ }
+  }
+
   function injectCollapseStyles() {
     if (document.getElementById('stb-collapse-styles')) return;
     const style = document.createElement('style');
@@ -1519,6 +1602,13 @@
       }
       /* Nothing to seek until a cast session exists. */
       #${BAR_ID}:not(.stb-casting) .stb-tvseek-wrap { opacity: .45; pointer-events: none; }
+
+      #${BAR_ID} .stb-vol-wrap { display: inline-flex; align-items: center; gap: 6px; }
+      #${BAR_ID} .stb-vol-wrap input { width: 92px; cursor: pointer; }
+      #${BAR_ID} .stb-vol-label {
+        font-size: 11px; opacity: .85; min-width: 34px;
+        font-variant-numeric: tabular-nums;
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
@@ -1638,9 +1728,13 @@
       <button type="button" class="stb-btn" data-stb-hold="volume/down">🔉</button>
       <button type="button" class="stb-btn" data-stb-media="volume/mute">🔇</button>
       <button type="button" class="stb-btn" data-stb-hold="volume/up">🔊</button>
+      <div class="stb-vol-wrap">
+        <input id="stb-vol" type="range" min="0" max="100" value="50" title="TV volume">
+        <span class="stb-vol-label" id="stb-vol-label">–</span>
+      </div>
       <span class="stb-sep"></span>
       <button type="button" class="stb-btn" data-stb-media="power/on" title="Turn TV on / wake">⏻</button>
-      <button type="button" class="stb-btn" data-stb-media="power/off" title="Turn TV off / sleep">⏼</button>
+      <button type="button" class="stb-btn" data-stb-media="power/off" title="Put TV to sleep">⏼</button>
       <span class="stb-status" id="stb-status"></span>
       <div class="stb-mode-wrap">
         <label for="stb-mode">Mode</label>
@@ -1692,6 +1786,7 @@
     // reference, so this bar mirrors the TV clock and seeks the TV directly.
     injectCollapseStyles();
     bindTvSeekBar(bar);
+    bindVolumeSlider(bar);
     const toggleBtn = bar.querySelector('[data-stb="toggle"]');
     toggleBtn.addEventListener('click', () => setBarCollapsed(!bar.classList.contains('stb-collapsed')));
 

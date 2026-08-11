@@ -64,6 +64,8 @@ async function handleMessage(request, sender) {
       return apiPost(`/media/${request.endpoint}`, {});
     case 'volume':
       return apiPost('/media/volume', { level: Number(request.level) || 0 });
+    case 'volumeGet':
+      return apiGet('/media/volume');
     case 'seek':
       return apiPost('/media/seek', {
         positionMs: Number(request.positionMs) || 0,

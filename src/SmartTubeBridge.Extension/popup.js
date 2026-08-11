@@ -188,6 +188,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
+  bindTvVolumeSlider();
+
   g('search-go').onclick = () => {
     const q = g('search-input').value.trim();
     if (q) send('search', { query: q });
@@ -416,6 +418,70 @@ async function refreshLogs() {
         }).join('\n')
       : 'No logs';
   } catch (e) { g('log-list').textContent = e.message; }
+}
+
+// ── TV volume slider ─────────────────────────────────────────────────────────
+// The TV ignores absolute volume set, so the service walks VOLUME_UP/DOWN to the
+// target — which takes a moment. Commit on release only, and let the newest target
+// win if the user moves the slider again mid-flight.
+let volumeBusy = false;
+let pendingVolumeTarget = null;
+
+function bindTvVolumeSlider() {
+  const slider = g('tv-volume');
+  const label = g('tv-volume-label');
+  if (!slider) return;
+
+  slider.addEventListener('input', () => {
+    if (label) label.textContent = `${slider.value}%`;
+  });
+
+  slider.addEventListener('change', async () => {
+    pendingVolumeTarget = Number(slider.value);
+    if (label) label.textContent = `${pendingVolumeTarget}%`;
+    if (volumeBusy) return;   // the running loop will pick the newer target up
+
+    volumeBusy = true;
+    try {
+      while (pendingVolumeTarget !== null) {
+        const target = pendingVolumeTarget;
+        pendingVolumeTarget = null;
+
+        const resp = await chrome.runtime.sendMessage({ action: 'volume', level: target });
+
+        // Moved again while that was in flight — send the newer value instead of
+        // painting a result the user has already superseded.
+        if (pendingVolumeTarget !== null) continue;
+
+        const d = resp?.data;
+        if (d && Number.isFinite(d.level)) {
+          slider.value = String(d.level);
+          if (label) label.textContent = `${d.level}%`;
+        }
+      }
+    } catch {
+      if (label) label.textContent = '!';
+    } finally {
+      volumeBusy = false;
+    }
+  });
+
+  refreshTvVolume();
+}
+
+async function refreshTvVolume() {
+  const slider = g('tv-volume');
+  const label = g('tv-volume-label');
+  if (!slider || volumeBusy) return;
+  try {
+    const resp = await chrome.runtime.sendMessage({ action: 'volumeGet' });
+    const d = resp?.data;
+    if (!d?.available) return;
+    slider.min = String(d.min ?? 0);
+    slider.max = String(d.max ?? 100);
+    slider.value = String(d.level);
+    if (label) label.textContent = `${d.level}%`;
+  } catch { /* leave the placeholder */ }
 }
 
 async function send(action, payload) {

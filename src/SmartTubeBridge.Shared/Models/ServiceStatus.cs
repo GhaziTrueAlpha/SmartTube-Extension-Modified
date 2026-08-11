@@ -4,7 +4,7 @@ namespace SmartTubeBridge.Shared.Models;
 
 public class ServiceStatus
 {
-    public string Version { get; set; } = "1.0.0";
+    public string Version { get; set; } = "1.5.0";
     public bool ServiceRunning { get; set; }
     public AdbState AdbState { get; set; } = AdbState.Unknown;
     public DeviceConnectionState DeviceState { get; set; } = DeviceConnectionState.Disconnected;

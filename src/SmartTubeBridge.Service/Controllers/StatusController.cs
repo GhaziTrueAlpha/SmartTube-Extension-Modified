@@ -30,7 +30,7 @@ public class StatusController : ControllerBase
 
         var status = new ServiceStatus
         {
-            Version = "1.0.0",
+            Version = "1.5.0",
             ServiceRunning = true,
             AdbState = _adb.State,
             DeviceState = device?.State ?? DeviceConnectionState.Disconnected,

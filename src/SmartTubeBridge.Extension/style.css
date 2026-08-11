@@ -156,6 +156,15 @@ kbd {
   flex: 1;
   accent-color: #1e88e5;
 }
+.vol-tag {
+  font-size: 13px;
+}
+.vol-label {
+  min-width: 38px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #b0bec5;
+}
 .seek-track {
   position: relative;
   flex: 1;

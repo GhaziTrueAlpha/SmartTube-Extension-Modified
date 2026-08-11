@@ -71,6 +71,13 @@ public class MediaCommandService : IMediaCommandService
         }
     }
 
+    public async Task<VolumeInfo?> GetVolumeAsync(string? deviceId = null, CancellationToken ct = default)
+    {
+        var device = ResolveDevice(deviceId);
+        if (device == null) return null;
+        return await _adb.GetVolumeAsync(device.Serial, ct);
+    }
+
     /// <summary>Wake the device without sending any media key after it.</summary>
     public async Task WakeAsync(string? deviceId = null, CancellationToken ct = default)
     {

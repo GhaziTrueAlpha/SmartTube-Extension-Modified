@@ -95,12 +95,42 @@ public class MediaController : ControllerBase
         return Ok(ApiResponse.Ok(message: "Mute toggled"));
     }
 
+    /// <summary>Current TV volume, plus the device's native range.</summary>
+    [HttpGet("volume")]
+    public async Task<ActionResult<ApiResponse>> GetVolume([FromQuery] string? deviceId = null)
+    {
+        var vol = await _media.GetVolumeAsync(deviceId);
+        if (vol is null)
+            return Ok(ApiResponse.Ok(new { available = false }));
+
+        return Ok(ApiResponse.Ok(new
+        {
+            available = true,
+            level = vol.Level,
+            min = vol.Min,
+            max = vol.Max,
+            percent = vol.Percent,
+        }));
+    }
+
+    /// <summary>
+    /// Sets absolute volume. The level is in the device's own range (read it from
+    /// GET volume) — the old 0-15 clamp was wrong for hardware reporting 0-100 and
+    /// silently capped every slider move.
+    /// </summary>
     [HttpPost("volume")]
     public async Task<ActionResult<ApiResponse>> SetVolume([FromBody] VolumeRequest? request)
     {
-        var level = Math.Clamp(request?.Level ?? 0, 0, 15);
+        var level = Math.Max(0, request?.Level ?? 0);
         await _media.SetVolumeAsync(level, request?.DeviceId);
-        return Ok(ApiResponse.Ok(new { level }, $"Volume set to {level}"));
+
+        var now = await _media.GetVolumeAsync(request?.DeviceId);
+        return Ok(ApiResponse.Ok(new
+        {
+            level = now?.Level ?? level,
+            max = now?.Max ?? 100,
+            percent = now?.Percent ?? 0,
+        }, $"Volume set to {now?.Level ?? level}"));
     }
 
     [HttpPost("seek")]

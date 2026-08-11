@@ -17,9 +17,22 @@ public interface IAdbService
     Task OpenUrlAsync(string serial, string url, string package, CancellationToken ct = default);
     Task WakeDeviceAsync(string serial, CancellationToken ct = default);
     Task SetVolumeAsync(string serial, int level, CancellationToken ct = default);
+    Task<VolumeInfo?> GetVolumeAsync(string serial, CancellationToken ct = default);
     Task SeekToAsync(string serial, long positionMs, string videoId, string package, CancellationToken ct = default);
     Task<PlaybackPosition?> GetPlaybackPositionAsync(string serial, CancellationToken ct = default);
     Task<bool> TestConnectionAsync(CancellationToken ct = default);
+}
+
+public sealed class VolumeInfo
+{
+    public int Level { get; set; }
+    public int Min { get; set; }
+    public int Max { get; set; } = 100;
+
+    /// <summary>Level as 0-100 regardless of the device's native range.</summary>
+    public int Percent => Max > Min
+        ? (int)Math.Round((Level - Min) * 100.0 / (Max - Min))
+        : 0;
 }
 
 public sealed class PlaybackPosition
